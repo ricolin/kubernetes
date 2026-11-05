@@ -4542,6 +4542,7 @@ func TestDoPodResizeAction(t *testing.T) {
 		// Mock configuration and runtime error injection
 		runtimeErrors               map[string][]error // mock failures for CRI calls to verify error propagation
 		injectPodUpdateCgroupsError error              // mock failures for cgroup writes to verify rollback flow
+		nilCgroupConfig             bool
 
 		// Expected overall test execution results
 		expectedError        string // overall Kubelet error type expected
@@ -4998,6 +4999,92 @@ func TestDoPodResizeAction(t *testing.T) {
 				Memory: ptr.To[int64](250),
 			},
 		},
+		{
+			testName: "Nil pod cgroup config does not panic (cgroupsPerQOS=false)",
+			currentResources: resourceRequirements{
+				cpuRequest: 100, cpuLimit: 100,
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			desiredResources: resourceRequirements{
+				cpuRequest: 200, cpuLimit: 200,
+				memoryRequest: 200, memoryLimit: 200,
+			},
+			otherContainersHaveLimits: true,
+			updatedResources:          []v1.ResourceName{v1.ResourceCPU, v1.ResourceMemory},
+			expectPodCgroupUpdates:    0, // pod cgroups not managed, no pod-level cgroup updates
+			nilCgroupConfig:           true,
+			expectedContainerResources: &cm.ResourceConfig{
+				CPUShares: ptr.To[uint64](204),
+				CPUQuota:  ptr.To[int64](20000),
+				Memory:    ptr.To[int64](200),
+			},
+		},
+		{
+			testName: "Nil pod cgroup config does not panic: CPU only",
+			currentResources: resourceRequirements{
+				cpuRequest: 100, cpuLimit: 100,
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			desiredResources: resourceRequirements{
+				cpuRequest: 200, cpuLimit: 200,
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			otherContainersHaveLimits: true,
+			updatedResources:          []v1.ResourceName{v1.ResourceCPU},
+			expectPodCgroupUpdates:    0,
+			nilCgroupConfig:           true,
+			expectedContainerResources: &cm.ResourceConfig{
+				CPUShares: ptr.To[uint64](204),
+				CPUQuota:  ptr.To[int64](20000),
+			},
+		},
+		{
+			testName: "Nil pod cgroup config does not panic: memory only",
+			currentResources: resourceRequirements{
+				cpuRequest: 100, cpuLimit: 100,
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			desiredResources: resourceRequirements{
+				cpuRequest: 100, cpuLimit: 100,
+				memoryRequest: 200, memoryLimit: 200,
+			},
+			otherContainersHaveLimits: true,
+			updatedResources:          []v1.ResourceName{v1.ResourceMemory},
+			expectPodCgroupUpdates:    0,
+			nilCgroupConfig:           true,
+			expectedContainerResources: &cm.ResourceConfig{
+				Memory: ptr.To[int64](200),
+			},
+		},
+		{
+			testName: "Nil pod cgroup config updates actuated pod-level resources",
+			currentResources: resourceRequirements{
+				cpuRequest: 100, cpuLimit: 100,
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			desiredResources: resourceRequirements{
+				cpuRequest: 200, cpuLimit: 200,
+				memoryRequest: 200, memoryLimit: 200,
+			},
+			currentPodLevelResources: &resourceRequirements{
+				cpuRequest: 100, cpuLimit: 100,
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			desiredPodLevelResources: &resourceRequirements{
+				cpuRequest: 200, cpuLimit: 200,
+				memoryRequest: 200, memoryLimit: 200,
+			},
+			updatedPodLevelResources: true,
+			updatedResources:         []v1.ResourceName{v1.ResourceCPU, v1.ResourceMemory},
+			expectPodCgroupUpdates:   0,
+			enablePLR:                true,
+			nilCgroupConfig:          true,
+			expectedContainerResources: &cm.ResourceConfig{
+				CPUShares: ptr.To[uint64](204),
+				CPUQuota:  ptr.To[int64](20000),
+				Memory:    ptr.To[int64](200),
+			},
+		},
 	} {
 		t.Run(tc.testName, func(t *testing.T) {
 			fakeRuntime, _, m, err := createTestRuntimeManager(tCtx, withErrors(tc.runtimeErrors))
@@ -5013,21 +5100,26 @@ func TestDoPodResizeAction(t *testing.T) {
 			mockPCM := cmtesting.NewMockPodContainerManager(t)
 			mockCM.EXPECT().NewPodContainerManager().Return(mockPCM)
 
-			mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
-				Memory: ptr.To(tc.currentResources.memoryLimit),
-			}, nil).Maybe()
-			mockPCM.EXPECT().GetPodCgroupMemoryUsage(mock.Anything).Return(0, nil).Maybe()
-			// Set up mock pod cgroup config
-			podCPURequest := tc.currentResources.cpuRequest
-			podCPULimit := tc.currentResources.cpuLimit
-			if tc.otherContainersHaveLimits {
-				podCPURequest += 200
-				podCPULimit += 200
+			if tc.nilCgroupConfig {
+				mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(nil, nil).Maybe()
+				mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(nil, nil).Maybe()
+			} else {
+				mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+					Memory: ptr.To(tc.currentResources.memoryLimit),
+				}, nil).Maybe()
+				// Set up mock pod cgroup config
+				podCPURequest := tc.currentResources.cpuRequest
+				podCPULimit := tc.currentResources.cpuLimit
+				if tc.otherContainersHaveLimits {
+					podCPURequest += 200
+					podCPULimit += 200
+				}
+				mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+					CPUShares: ptr.To(cm.MilliCPUToShares(podCPURequest)),
+					CPUQuota:  ptr.To(cm.MilliCPUToQuota(podCPULimit, cm.QuotaPeriod)),
+				}, nil).Maybe()
 			}
-			mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
-				CPUShares: ptr.To(cm.MilliCPUToShares(podCPURequest)),
-				CPUQuota:  ptr.To(cm.MilliCPUToQuota(podCPULimit, cm.QuotaPeriod)),
-			}, nil).Maybe()
+			mockPCM.EXPECT().GetPodCgroupMemoryUsage(mock.Anything).Return(0, nil).Maybe()
 			if tc.expectPodCgroupUpdates > 0 {
 				call := mockPCM.EXPECT().SetPodCgroupConfig(logger, mock.Anything, mock.Anything).Run(func(logger klog.Logger, pod *v1.Pod, rc *cm.ResourceConfig) {
 					require.NotNil(t, rc, "ResourceConfig should not be nil")
